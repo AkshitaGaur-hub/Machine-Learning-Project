@@ -1,181 +1,114 @@
-from pathlib import Path
+"""Live webcam recognition using the exact trained MobileNetV2 + six-model bundle."""
+from __future__ import annotations
+
+import argparse
 import time
+from pathlib import Path
+
 import cv2
 import joblib
 import numpy as np
-import pandas as pd
-from skimage.feature import hog
+import tensorflow as tf
 
-BASE_DIR = Path(__file__).resolve().parent
-MODEL_DIR = BASE_DIR / "results" / "models"
-COMPARISON_CSV = BASE_DIR / "results" / "model_comparison.csv"
-
-IMAGE_SIZE = (128, 128)  # (width, height), same as train_models.py
-CAMERA_INDEX = 0
-CAMERA_WIDTH = 1280
-CAMERA_HEIGHT = 720
-SMOOTHING_FRAMES = 5
-
-
-def resize_with_pad(gray_image, target_size):
-    target_w, target_h = target_size
-    h, w = gray_image.shape[:2]
-    if h == 0 or w == 0:
-        raise ValueError("Empty image received.")
-    scale = min(target_w / w, target_h / h)
-    new_w = max(1, int(round(w * scale)))
-    new_h = max(1, int(round(h * scale)))
-    resized = cv2.resize(gray_image, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    top = (target_h - new_h) // 2
-    bottom = target_h - new_h - top
-    left = (target_w - new_w) // 2
-    right = target_w - new_w - left
-    return cv2.copyMakeBorder(
-        resized, top, bottom, left, right,
-        cv2.BORDER_CONSTANT, value=0
-    )
-
-
-def extract_hog_from_frame(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    resized = resize_with_pad(gray, IMAGE_SIZE)
-    features = hog(
-        resized,
-        orientations=9,
-        pixels_per_cell=(8, 8),
-        cells_per_block=(2, 2),
-        block_norm="L2-Hys",
-        transform_sqrt=False,
-        feature_vector=True,
-    )
-    return features.astype(np.float32).reshape(1, -1)
-
-
-def load_models():
-    if not MODEL_DIR.is_dir():
-        raise FileNotFoundError(
-            f"Models folder not found: {MODEL_DIR}\n"
-            "Run python train_models.py first."
-        )
-
-    model_paths = sorted(MODEL_DIR.glob("*.joblib"))
-    if not model_paths:
-        raise FileNotFoundError(
-            f"No .joblib models found in {MODEL_DIR}. Run python train_models.py first."
-        )
-
-    # Order models by current run's held-out accuracy, if comparison file exists.
-    order = {}
-    if COMPARISON_CSV.exists():
-        try:
-            df = pd.read_csv(COMPARISON_CSV)
-            if {"Model", "Accuracy (%)"}.issubset(df.columns):
-                order = dict(zip(df["Model"], df["Accuracy (%)"]))
-        except Exception as exc:
-            print(f"Could not read comparison CSV: {exc}")
-
-    loaded = []
-    for path in model_paths:
-        try:
-            bundle = joblib.load(path)
-            if not isinstance(bundle, dict) or "model" not in bundle:
-                print(f"Skipping unsupported model bundle: {path.name}")
-                continue
-            if tuple(bundle.get("image_size", ())) != IMAGE_SIZE:
-                print(f"Skipping {path.name}: image size doesn't match webcam settings.")
-                continue
-            model_name = bundle.get("model_name", path.stem.replace("_", " ").title())
-            accuracy = order.get(model_name, None)
-            loaded.append((model_name, bundle, accuracy, path.name))
-        except Exception as exc:
-            print(f"Could not load {path.name}: {exc}")
-
-    loaded.sort(key=lambda item: (
-        item[2] is None,
-        -(float(item[2]) if item[2] is not None else 0.0),
-        item[0]
-    ))
-    if not loaded:
-        raise RuntimeError("No compatible trained models could be loaded.")
-    return loaded
+from preprocessing import IMAGE_SIZE, extract_embeddings
+from ensemble import calibrated_probabilities, decide_one
+from unknown_detection import nearest_centroid_distance
 
 
 def main():
-    models = load_models()
-    print("Loaded models:")
-    for name, _, accuracy, filename in models:
-        suffix = f" — test accuracy {accuracy:.2f}%" if accuracy is not None else ""
-        print(f"  {name}{suffix} ({filename})")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--models-dir", default="models")
+    parser.add_argument("--camera", type=int, default=0)
+    args = parser.parse_args()
+    models_dir = Path(args.models_dir)
+    extractor_path = models_dir / "mobilenetv2_feature_extractor.keras"
+    bundle_path = models_dir / "six_model_bundle.joblib"
+    if not extractor_path.exists() or not bundle_path.exists():
+        raise SystemExit("Models missing. Run `python train_models.py` first.")
 
-    # DirectShow works well on many Windows installations; fall back if unavailable.
-    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+    print("Loading feature extractor and six classifiers...")
+    extractor = tf.keras.models.load_model(extractor_path, compile=False)
+    bundle = joblib.load(bundle_path)
+    models, classes = bundle["models"], bundle["classes"]
+    weights = bundle["weights"]
+    # Warm-up to avoid first-capture latency spike.
+    extractor.predict(np.zeros((1, 224, 224, 3), dtype=np.float32), verbose=0)
+
+    cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW if hasattr(cv2, "CAP_DSHOW") else 0)
     if not cap.isOpened():
-        cap.release()
-        cap = cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened():
-        raise RuntimeError(
-            f"Could not open webcam index {CAMERA_INDEX}. "
-            "Close other camera apps or try CAMERA_INDEX = 1."
-        )
+        raise SystemExit("Could not open webcam. Check camera permissions or --camera index.")
+    print("SPACE = capture and predict | Q = quit")
+    last_lines = ["Place one object inside the rectangle.", "Press SPACE to capture."]
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            print("Webcam frame could not be read.")
+            break
+        h, w = frame.shape[:2]
+        # Fixed centred guide. The same centre-square crop is applied at prediction.
+        side = int(min(h, w) * 0.68)
+        x1, y1 = (w - side) // 2, (h - side) // 2
+        x2, y2 = x1 + side, y1 + side
+        display = frame.copy()
+        cv2.rectangle(display, (x1, y1), (x2, y2), (60, 220, 90), 2)
+        cv2.putText(display, "Place ONE object here | SPACE: capture | Q: quit",
+                    (18, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2)
+        for i, line in enumerate(last_lines[-5:]):
+            cv2.putText(display, line[:75], (18, h - 110 + i * 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (40, 240, 255), 1, cv2.LINE_AA)
+        cv2.imshow("Real-world object recognition", display)
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord("q"), ord("Q")):
+            break
+        if key == 32:
+            # Inference timer starts after the user has positioned the object.
+            captured = frame[y1:y2, x1:x2]
+            rgb = cv2.cvtColor(captured, cv2.COLOR_BGR2RGB)
+            feature_start = time.perf_counter()
+            embedding = extract_embeddings([rgb], extractor, batch_size=1)
+            feature_time = time.perf_counter() - feature_start
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+            model_start = time.perf_counter()
+            probabilities, predictions = {}, {}
+            for name, model in models.items():
+                p = calibrated_probabilities(model, embedding, classes)[0]
+                probabilities[name] = {c: float(p[j]) for j, c in enumerate(classes)}
+                predictions[name] = str(model.predict(embedding)[0])
+            model_time = time.perf_counter() - model_start
 
-    history = {name: [] for name, _, _, _ in models}
-    previous_time = time.time()
+            ensemble_start = time.perf_counter()
+            distance = float(nearest_centroid_distance(embedding, bundle["centroids"])[0])
+            result = decide_one(
+                probabilities, predictions, weights, distance,
+                bundle["distance_threshold"], bundle["confidence_threshold"],
+                bundle.get("min_agreement", 4)
+            )
+            ensemble_time = time.perf_counter() - ensemble_start
+            total = feature_time + model_time + ensemble_time
 
-    try:
-        while True:
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                print("Warning: webcam frame could not be read.")
-                break
-
-            frame = cv2.flip(frame, 1)
-            feature = extract_hog_from_frame(frame)
-
-            lines = []
-            for model_name, bundle, accuracy, _ in models:
-                prediction = bundle["model"].predict(feature)[0]
-                label = str(prediction)
-
-                # Smooth brief flicker in predictions.
-                history[model_name].append(label)
-                if len(history[model_name]) > SMOOTHING_FRAMES:
-                    history[model_name].pop(0)
-                counts = {item: history[model_name].count(item) for item in set(history[model_name])}
-                stable_label = max(counts, key=counts.get)
-
-                suffix = f" ({accuracy:.1f}%)" if accuracy is not None else ""
-                lines.append((model_name, stable_label, suffix))
-
-            # Show camera preview and six model predictions.
-            y0 = 35
-            cv2.rectangle(frame, (10, 10), (min(frame.shape[1] - 10, 660), 40 + 30 * len(lines)), (0, 0, 0), -1)
-            cv2.putText(frame, "HOG OBJECT RECOGNITION  |  Press Q to quit",
-                        (20, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-
-            for i, (model_name, label, suffix) in enumerate(lines):
-                text = f"{model_name}: {label}{suffix}"
-                cv2.putText(
-                    frame, text, (20, y0 + 30 * (i + 1)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.58,
-                    (0, 255, 0), 2, cv2.LINE_AA
-                )
-
-            now = time.time()
-            fps = 1.0 / max(now - previous_time, 1e-6)
-            previous_time = now
-            cv2.putText(frame, f"FPS: {fps:.1f}", (frame.shape[1] - 140, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-
-            cv2.imshow("Object Recognition - Six Classifiers", frame)
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), ord("Q"), 27):
-                break
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
+            print("\nINDIVIDUAL MODEL PREDICTIONS")
+            for name in models:
+                print(f"{name:22s}: {predictions[name]}")
+            print("\nENSEMBLE ANALYSIS")
+            print(f"Predicted class: {result['predicted_class']}")
+            print(f"Model agreement: {result['agreement']}/6")
+            print(f"Ensemble confidence: {result['ensemble_confidence']:.4f}")
+            print(f"Nearest-centroid cosine distance: {distance:.4f} (limit {bundle['distance_threshold']:.4f})")
+            print(f"Novelty check: {'PASS' if result['novelty_pass'] else 'FAIL'}")
+            print(f"Feature extraction: {feature_time:.3f}s | Six models: {model_time:.3f}s | Decision: {ensemble_time:.3f}s")
+            print(f"Total inference: {total:.3f}s")
+            if result["accepted"]:
+                final = f"OBJECT FOUND: {result['predicted_class'].upper()}"
+            else:
+                final = "OBJECT NOT FOUND"
+            print(f"\nFINAL RESULT:\n{final}\n")
+            last_lines = [
+                f"Result: {final}",
+                f"Agreement: {result['agreement']}/6  Confidence: {result['ensemble_confidence']:.2f}",
+                f"Novelty: {'PASS' if result['novelty_pass'] else 'FAIL'}  Time: {total:.2f}s"
+            ]
+    cap.release()
+    cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

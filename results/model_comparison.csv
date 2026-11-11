@@ -1,7 +1,0 @@
-Model,Accuracy (%),Model File
-Random Forest,88.89,random_forest.joblib
-SVC,88.89,svc.joblib
-Logistic Regression,87.3,logistic_regression.joblib
-KNN,81.75,knn.joblib
-Naive Bayes,78.57,naive_bayes.joblib
-Decision Tree,55.56,decision_tree.joblib

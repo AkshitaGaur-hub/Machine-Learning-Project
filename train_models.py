@@ -1,325 +1,247 @@
+"""Train MobileNetV2 embeddings + six traditional classifiers.
 
+Run from project root:
+    python train_models.py --dataset dataset --augmentation-versions 2
+
+Original images are split BEFORE augmentation. Unknown images are never a known class.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import time
 from pathlib import Path
-import warnings
 
-import cv2
 import joblib
 import numpy as np
-import pandas as pd
-
-from skimage.feature import hog
+import tensorflow as tf
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.naive_bayes import GaussianNB
-from sklearn.neighbors import KNeighborsClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.naive_bayes import GaussianNB
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.calibration import CalibratedClassifierCV
 
-warnings.filterwarnings("ignore")
+from preprocessing import read_rgb, list_images, make_augmentations, extract_embeddings
+from model_evaluation import evaluate_classifier, save_json, open_set_metrics
+from unknown_detection import class_centroids, nearest_centroid_distance, calibrate_distance_threshold
+from ensemble import normalized_weights, calibrated_probabilities, decide_one
 
-# --------------------------------------------------
-# Paths and settings
-# --------------------------------------------------
-BASE_DIR = Path(__file__).resolve().parent
-DATASET_DIR = BASE_DIR / "dataset"
-RESULTS_DIR = BASE_DIR / "results"
-MODEL_DIR = RESULTS_DIR / "models"
-COMPARISON_CSV = RESULTS_DIR / "model_comparison.csv"
-
-IMAGE_SIZE = (128, 128)  # (width, height)
-TEST_SIZE = 0.25
-RANDOM_STATE = 42
-
-SUPPORTED_EXTENSIONS = {
-    ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"
-}
+SEED = 42
+CLASSIFIERS = ["Random Forest", "SVM", "Logistic Regression", "KNN", "Naive Bayes", "Decision Tree"]
 
 
-# --------------------------------------------------
-# Image preprocessing: must match webcam code
-# --------------------------------------------------
-def resize_with_pad(gray_image, target_size):
-    target_w, target_h = target_size
-    h, w = gray_image.shape[:2]
-
-    if h == 0 or w == 0:
-        raise ValueError("Empty image received.")
-
-    scale = min(target_w / w, target_h / h)
-    new_w = max(1, int(round(w * scale)))
-    new_h = max(1, int(round(h * scale)))
-
-    resized = cv2.resize(
-        gray_image,
-        (new_w, new_h),
-        interpolation=cv2.INTER_AREA
-    )
-
-    top = (target_h - new_h) // 2
-    bottom = target_h - new_h - top
-    left = (target_w - new_w) // 2
-    right = target_w - new_w - left
-
-    return cv2.copyMakeBorder(
-        resized,
-        top,
-        bottom,
-        left,
-        right,
-        cv2.BORDER_CONSTANT,
-        value=0
-    )
+def load_partition(paths, labels):
+    images, good_labels, good_paths = [], [], []
+    for path, label in zip(paths, labels):
+        image = read_rgb(path)
+        if image is not None:
+            images.append(image)
+            good_labels.append(label)
+            good_paths.append(path)
+    return images, np.asarray(good_labels), good_paths
 
 
-def extract_hog_features(gray_image):
-    resized = resize_with_pad(gray_image, IMAGE_SIZE)
-
-    features = hog(
-        resized,
-        orientations=9,
-        pixels_per_cell=(8, 8),
-        cells_per_block=(2, 2),
-        block_norm="L2-Hys",
-        transform_sqrt=False,
-        feature_vector=True
-    )
-
-    return features.astype(np.float32)
-
-
-# --------------------------------------------------
-# Read dataset folders
-# --------------------------------------------------
-def load_dataset():
-    if not DATASET_DIR.is_dir():
-        raise FileNotFoundError(
-            f"Dataset folder not found: {DATASET_DIR}"
-        )
-
-    class_folders = sorted(
-        folder for folder in DATASET_DIR.iterdir()
-        if folder.is_dir()
-        and folder.name.startswith("class_")
-        and folder.name != ".ipynb_checkpoints"
-    )
-
-    if not class_folders:
-        raise RuntimeError(
-            f"No class folders found in {DATASET_DIR}. "
-            "Expected folders such as class_00_perfume."
-        )
-
-    features = []
-    labels = []
-    class_counts = {}
-
-    print("\nReading dataset images...")
-
-    for folder in class_folders:
-        # Example: class_00_perfume -> perfume
-        class_name = folder.name.split("_", 2)[-1]
-
-        image_files = sorted(
-            path for path in folder.rglob("*")
-            if path.is_file()
-            and path.suffix.lower() in SUPPORTED_EXTENSIONS
-        )
-
-        loaded_count = 0
-
-        for image_path in image_files:
-            image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
-
-            if image is None:
-                print(f"Skipping unreadable image: {image_path}")
-                continue
-
-            try:
-                feature = extract_hog_features(image)
-            except Exception as exc:
-                print(f"Skipping {image_path}: {exc}")
-                continue
-
-            features.append(feature)
-            labels.append(class_name)
-            loaded_count += 1
-
-        class_counts[class_name] = loaded_count
-        print(f"  {class_name}: {loaded_count} images")
-
-    if not features:
-        raise RuntimeError("No readable dataset images were found.")
-
-    # A stratified train/test split requires at least two images per class.
-    too_small = {
-        name: count for name, count in class_counts.items()
-        if count < 2
-    }
-
-    if too_small:
-        raise ValueError(
-            "Each class needs at least 2 readable images. "
-            f"Classes with too few images: {too_small}"
-        )
-
-    X = np.asarray(features, dtype=np.float32)
-    y = np.asarray(labels, dtype=str)
-    class_names = sorted(set(labels))
-
-    print(f"\nTotal images: {len(y)}")
-    print(f"Number of classes: {len(class_names)}")
-    print(f"Classes: {', '.join(class_names)}")
-    print(f"HOG feature vector size: {X.shape[1]}")
-
-    return X, y, class_names
-
-
-# --------------------------------------------------
-# Define six classifiers
-# --------------------------------------------------
-def create_models(min_train_class_count):
-    knn_neighbors = min(5, min_train_class_count)
-
-    return {
-        "Logistic Regression": make_pipeline(
-            StandardScaler(),
-            LogisticRegression(
-                max_iter=3000,
-                random_state=RANDOM_STATE
-            )
-        ),
-
-        "Decision Tree": DecisionTreeClassifier(
-            random_state=RANDOM_STATE
-        ),
-
-        "Naive Bayes": GaussianNB(),
-
-        "KNN": make_pipeline(
-            StandardScaler(),
-            KNeighborsClassifier(
-                n_neighbors=knn_neighbors
-            )
-        ),
-
-        "Random Forest": RandomForestClassifier(
-            n_estimators=200,
-            random_state=RANDOM_STATE,
-            n_jobs=-1,
-            class_weight="balanced"
-        ),
-
-        "SVC": make_pipeline(
-            StandardScaler(),
-            SVC(
-                kernel="rbf",
-                C=10,
-                probability=True,
-                random_state=RANDOM_STATE
-            )
-        )
-    }
-
-
-# --------------------------------------------------
-# Train and save models
-# --------------------------------------------------
 def main():
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", default="dataset")
+    parser.add_argument("--models-dir", default="models")
+    parser.add_argument("--reports-dir", default="reports")
+    parser.add_argument("--augmentation-versions", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=32)
+    args = parser.parse_args()
+    started = time.perf_counter()
+    random.seed(SEED)
+    np.random.seed(SEED)
+    tf.random.set_seed(SEED)
 
-    X, y, class_names = load_dataset()
+    dataset = Path(args.dataset)
+    models_dir, reports_dir = Path(args.models_dir), Path(args.reports_dir)
+    models_dir.mkdir(parents=True, exist_ok=True)
+    reports_dir.mkdir(parents=True, exist_ok=True)
 
-    # Check that every class has enough images for stratification.
-    _, counts = np.unique(y, return_counts=True)
-    if counts.min() < 2:
-        raise ValueError("Every class needs at least 2 images.")
+    class_dirs = sorted(p for p in dataset.iterdir() if p.is_dir() and p.name.lower() != "unknown")
+    if len(class_dirs) != 10:
+        raise SystemExit(f"Expected 10 known class folders; found {len(class_dirs)}: {[p.name for p in class_dirs]}")
+    classes = [p.name for p in class_dirs]
+    paths, labels = [], []
+    for folder in class_dirs:
+        found = list_images(folder)
+        print(f"{folder.name}: {len(found)} images")
+        paths.extend(found)
+        labels.extend([folder.name] * len(found))
+    if not paths:
+        raise SystemExit("No known images found.")
+    print(f"Total known images: {len(paths)}")
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=TEST_SIZE,
-        random_state=RANDOM_STATE,
-        stratify=y
+    # Split source/original images first: 70/15/15, stratified.
+    p_train, p_temp, y_train, y_temp = train_test_split(
+        paths, labels, test_size=0.30, random_state=SEED, stratify=labels
     )
+    p_val, p_test, y_val, y_test = train_test_split(
+        p_temp, y_temp, test_size=0.50, random_state=SEED, stratify=y_temp
+    )
+    print(f"Original split: train={len(p_train)}, validation={len(p_val)}, test={len(p_test)}")
 
-    _, train_counts = np.unique(y_train, return_counts=True)
-    models = create_models(int(train_counts.min()))
+    train_images, y_train_arr, p_train = load_partition(p_train, y_train)
+    val_images, y_val_arr, _ = load_partition(p_val, y_val)
+    test_images, y_test_arr, _ = load_partition(p_test, y_test)
+    if len(set(y_train_arr)) != 10 or len(set(y_val_arr)) != 10 or len(set(y_test_arr)) != 10:
+        raise SystemExit("At least one split is missing a class. Add more original images per class.")
 
-    # Remove old model files so obsolete classifiers cannot be loaded.
-    for old_file in MODEL_DIR.glob("*.joblib"):
-        old_file.unlink()
+    unknown_dir = dataset / "unknown"
+    unknown_paths = list_images(unknown_dir)
+    print(f"Unknown reference images: {len(unknown_paths)} (not a known class)")
+    # Unknowns are split separately and never included in classifier fitting.
+    if len(unknown_paths) >= 4:
+        u_val_paths, u_test_paths = train_test_split(unknown_paths, test_size=0.5, random_state=SEED)
+    else:
+        u_val_paths, u_test_paths = unknown_paths, []
 
-    results = []
+    base = tf.keras.applications.MobileNetV2(
+        weights="imagenet", include_top=False, pooling="avg", input_shape=(224, 224, 3)
+    )
+    base.trainable = False
+    inputs = tf.keras.Input(shape=(224, 224, 3))
+    outputs = base(inputs, training=False)
+    extractor = tf.keras.Model(inputs, outputs, name="mobilenetv2_feature_extractor")
+    # Save architecture/weights so webcam uses the same exact feature extractor.
+    extractor.save(models_dir / "mobilenetv2_feature_extractor.keras")
+    extractor.predict(np.zeros((1, 224, 224, 3), dtype=np.float32), verbose=0)
 
-    print("\nTraining six classifiers...\n")
+    rng = np.random.default_rng(SEED)
+    augmented_images = list(train_images)
+    augmented_labels = list(y_train_arr)
+    for image, label in zip(train_images, y_train_arr):
+        for aug in make_augmentations(image, args.augmentation_versions, rng):
+            augmented_images.append(aug)
+            augmented_labels.append(label)
+    # Concatenation order and labels are appended together, preserving alignment.
+    print(f"Training images after augmentation: {len(augmented_images)}")
+    print("Extracting training embeddings...")
+    X_train = extract_embeddings(augmented_images, extractor, args.batch_size)
+    y_train_aug = np.asarray(augmented_labels)
+    print("Extracting validation/test embeddings...")
+    X_val = extract_embeddings(val_images, extractor, args.batch_size)
+    X_test = extract_embeddings(test_images, extractor, args.batch_size)
+    X_u_val = extract_embeddings([im for p in u_val_paths if (im := read_rgb(p)) is not None], extractor, args.batch_size)
+    X_u_test = extract_embeddings([im for p in u_test_paths if (im := read_rgb(p)) is not None], extractor, args.batch_size)
 
-    for model_name, model in models.items():
-        print(f"Training {model_name}...")
+    models = {
+        "Random Forest": RandomForestClassifier(n_estimators=400, max_features="sqrt", class_weight="balanced", random_state=SEED, n_jobs=-1),
+        "SVM": make_pipeline(StandardScaler(), SVC(C=5.0, kernel="rbf", probability=True, class_weight="balanced", random_state=SEED)),
+        "Logistic Regression": make_pipeline(StandardScaler(), LogisticRegression(C=2.0, max_iter=3000, class_weight="balanced", random_state=SEED)),
+        "KNN": make_pipeline(StandardScaler(), KNeighborsClassifier(n_neighbors=min(5, max(1, len(X_train) // 10)), weights="distance", metric="minkowski")),
+        "Naive Bayes": GaussianNB(var_smoothing=1e-8),
+        "Decision Tree": DecisionTreeClassifier(class_weight="balanced", min_samples_leaf=2, random_state=SEED)
+    }
+    bundle_models, reports = {}, {"classes": classes, "seed": SEED, "split": {"train_original": len(p_train), "validation": len(y_val_arr), "test": len(y_test_arr)}, "unknown_reference_count": len(unknown_paths), "models": {}}
+    validation_scores = {}
+    for name, model in models.items():
+        print(f"\nTraining {name}...")
+        model.fit(X_train, y_train_aug)
+        # Calibrate probability scores on validation set where possible.
+        # SVC already exposes probabilities; sklearn pipeline models expose predict_proba.
+        bundle_models[name] = model
+        val_report = evaluate_classifier(name, model, X_val, y_val_arr, classes, reports_dir, "validation")
+        test_report = evaluate_classifier(name, model, X_test, y_test_arr, classes, reports_dir, "test")
+        validation_scores[name] = val_report["balanced_accuracy"]
+        reports["models"][name] = {"validation": val_report, "test": test_report}
+        print(f"{name}: val acc={val_report['accuracy']:.4f}, test acc={test_report['accuracy']:.4f}, test F1={test_report['f1_weighted']:.4f}")
 
-        model.fit(X_train, y_train)
-        predictions = model.predict(X_test)
+    weights = normalized_weights(validation_scores)
+    centroids = class_centroids(X_train, y_train_aug, classes)
+    known_val_dist = nearest_centroid_distance(X_val, centroids)
+    unknown_val_dist = nearest_centroid_distance(X_u_val, centroids) if len(X_u_val) else None
+    distance_threshold = calibrate_distance_threshold(known_val_dist, unknown_val_dist)
+    # Calibrate ensemble confidence threshold from correctly predicted known validation examples,
+    # with a conservative quantile. Unknown validation scores also inform threshold if available.
+    def ensemble_rows(X):
+        probs_by_model, preds_by_model = {}, {}
+        for n, m in bundle_models.items():
+            p = calibrated_probabilities(m, X, classes)
+            probs_by_model[n] = p
+            preds_by_model[n] = m.predict(X)
+        rows = []
+        for i in range(len(X)):
+            probs = {n: {c: float(probs_by_model[n][i, j]) for j, c in enumerate(classes)} for n in bundle_models}
+            preds = {n: str(preds_by_model[n][i]) for n in bundle_models}
+            rows.append(decide_one(probs, preds, weights, 0.0, 1.0, 0.0, min_agreement=1))
+        return rows
+    val_rows = ensemble_rows(X_val)
+    known_conf = np.array([r["ensemble_confidence"] for r in val_rows])
+    confidence_threshold = float(np.quantile(known_conf, 0.10)) if len(known_conf) else 0.5
+    if len(X_u_val):
+        u_rows = ensemble_rows(X_u_val)
+        # choose threshold to improve balanced known/unknown validation separation,
+        # while retaining at least 90% of known validation samples.
+        candidates = np.unique(np.concatenate([known_conf, [r["ensemble_confidence"] for r in u_rows]]))
+        best_t, best_score = confidence_threshold, -1
+        for t in candidates:
+            ka = np.mean(known_conf >= t)
+            ur = np.mean([r["ensemble_confidence"] < t for r in u_rows])
+            if ka >= 0.90 and 0.5 * (ka + ur) > best_score:
+                best_t, best_score = float(t), float(0.5 * (ka + ur))
+        confidence_threshold = best_t
 
-        accuracy = accuracy_score(y_test, predictions) * 100
-
-        safe_name = model_name.lower().replace(" ", "_")
-        model_path = MODEL_DIR / f"{safe_name}.joblib"
-
-        # Store metadata for the webcam script.
-        bundle = {
-            "model": model,
-            "model_name": model_name,
-            "image_size": IMAGE_SIZE,
-            "class_names": class_names,
-            "feature_type": "HOG",
-            "orientations": 9,
-            "pixels_per_cell": (8, 8),
-            "cells_per_block": (2, 2),
-            "block_norm": "L2-Hys",
-            "transform_sqrt": False
-        }
-
-        joblib.dump(bundle, model_path)
-
-        results.append({
-            "Model": model_name,
-            "Accuracy (%)": round(accuracy, 2),
-            "Model File": model_path.name
-        })
-
-        print(f"  Test accuracy: {accuracy:.2f}%")
-        print(f"  Saved: {model_path.name}")
-
-        print("\nClassification report:")
-        print(
-            classification_report(
-                y_test,
-                predictions,
-                labels=class_names,
-                zero_division=0
-            )
-        )
-
-    # Highest test accuracy first. This column is read by webcam_predict.py.
-    comparison = pd.DataFrame(results)
-    comparison = comparison.sort_values(
-        "Accuracy (%)",
-        ascending=False
-    ).reset_index(drop=True)
-
-    comparison.to_csv(COMPARISON_CSV, index=False)
-
-    print("\n" + "=" * 55)
-    print("TRAINING COMPLETE")
-    print("=" * 55)
-    print(comparison.to_string(index=False))
-    print(f"\nModels saved in: {MODEL_DIR}")
-    print(f"Comparison saved in: {COMPARISON_CSV}")
-    print("\nNext, run: python webcam_predict.py")
+    # Evaluate ensemble on known test set and unknown test set, using frozen validation thresholds.
+    test_rows = ensemble_rows(X_test)
+    test_dist = nearest_centroid_distance(X_test, centroids)
+    accepted_known, ens_pred = [], []
+    for row, dist in zip(test_rows, test_dist):
+        final = decide_one(
+            {n: {c: row["scores"][c] for c in classes} for n in []}, {}, weights,
+            float(dist), distance_threshold, confidence_threshold
+        ) if False else None
+        accepted = row["ensemble_confidence"] >= confidence_threshold and row["agreement"] >= 4 and dist <= distance_threshold
+        accepted_known.append(accepted)
+        ens_pred.append(row["predicted_class"] if accepted else "OBJECT NOT FOUND")
+    known_accuracy = float(np.mean(np.asarray(ens_pred) == y_test_arr))
+    unknown_accept = []
+    if len(X_u_test):
+        u_rows_test = ensemble_rows(X_u_test)
+        u_dist_test = nearest_centroid_distance(X_u_test, centroids)
+        unknown_accept = [
+            r["ensemble_confidence"] >= confidence_threshold and r["agreement"] >= 4 and d <= distance_threshold
+            for r, d in zip(u_rows_test, u_dist_test)
+        ]
+    reports["ensemble"] = {
+        "validation_weights": weights,
+        "validation_balanced_accuracies": validation_scores,
+        "confidence_threshold": confidence_threshold,
+        "distance_threshold": distance_threshold,
+        "minimum_agreement": 4,
+        "known_test_accuracy_including_rejections": known_accuracy,
+        "open_set_test_metrics": open_set_metrics(np.asarray(accepted_known), np.asarray(unknown_accept)),
+        "note": "Thresholds/weights calibrated only on validation data. Test set used only for final evaluation."
+    }
+    bundle = {
+        "models": bundle_models, "classes": classes, "weights": weights,
+        "confidence_threshold": confidence_threshold,
+        "distance_threshold": distance_threshold, "min_agreement": 4,
+        "centroids": centroids, "feature_dim": int(X_train.shape[1]),
+        "preprocessing": "RGB 224x224, MobileNetV2 preprocess_input, pooled embeddings, L2 normalized"
+    }
+    joblib.dump(bundle, models_dir / "six_model_bundle.joblib", compress=3)
+    save_json(reports, models_dir / "training_report.json")
+    save_json(reports, reports_dir / "training_report.json")
+    print("\nENSEMBLE")
+    print(f"Validation weights: {weights}")
+    print(f"Confidence threshold: {confidence_threshold:.4f}")
+    print(f"Cosine-distance threshold: {distance_threshold:.4f}")
+    print(f"Known test accuracy incl. rejections: {known_accuracy:.4f}")
+    if len(X_u_test):
+        print(f"Unknown rejection rate: {reports['ensemble']['open_set_test_metrics']['unknown_rejection_rate']:.4f}")
+        print(f"Unknown false acceptance rate: {reports['ensemble']['open_set_test_metrics']['unknown_false_acceptance_rate']:.4f}")
+    print(f"Saved: {models_dir / 'mobilenetv2_feature_extractor.keras'}")
+    print(f"Saved: {models_dir / 'six_model_bundle.joblib'}")
+    print(f"Saved: {models_dir / 'training_report.json'}")
+    print(f"Total training time: {time.perf_counter() - started:.1f}s")
 
 
 if __name__ == "__main__":
